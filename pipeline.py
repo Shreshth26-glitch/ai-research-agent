@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 from dotenv import load_dotenv
 import google.generativeai as genai
 from pydantic import BaseModel, Field
@@ -34,7 +35,7 @@ class ResearchFindings(BaseModel):
         description="A list of specific source URLs supporting the answer, extracted from the provided search results."
     )
 
-# 1. Define a Pydantic model CriticReview
+# Define a Pydantic model CriticReview
 class CriticReview(BaseModel):
     is_sufficient: bool = Field(
         ...,
@@ -55,7 +56,7 @@ class CriticReview(BaseModel):
 
 def get_model_name() -> str:
     """Finds the most suitable available Gemini model, prioritizing stable ones."""
-    preferred_models = ["gemini-3.5-flash", "gemini-3.6-flash"]
+    preferred_models = ["gemini-3.5-flash-lite", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.6-flash"]
     try:
         available_models = [m.name.replace("models/", "") for m in genai.list_models()]
         for model in preferred_models:
@@ -63,7 +64,25 @@ def get_model_name() -> str:
                 return model
     except Exception:
         pass
-    return "gemini-3.5-flash"  # default fallback
+    return "gemini-3.5-flash-lite"  # default fallback
+
+def generate_content_with_retry(model, *args, **kwargs):
+    """Wrapper around model.generate_content to handle rate limits (429/ResourceExhausted)."""
+    max_retries = 5
+    base_delay = 15.0
+    for attempt in range(max_retries):
+        try:
+            return model.generate_content(*args, **kwargs)
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "quota" in error_str or "resource_exhausted" in error_str or "resourceexhausted" in error_str:
+                delay = base_delay + (attempt * 5)
+                print(f"\n[Rate Limit] 429 Quota Exceeded. Retrying in {delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                raise e
+    # Final try that will raise the exception if it still fails
+    return model.generate_content(*args, **kwargs)
 
 # Write a function planner(research_question: str) -> SubQuestions
 def planner(research_question: str) -> SubQuestions:
@@ -97,7 +116,8 @@ def researcher(sub_question: str) -> ResearchFindings:
         temperature=0.2
     )
     
-    response = model.generate_content(
+    response = generate_content_with_retry(
+        model,
         prompt,
         generation_config=generation_config
     )
@@ -114,7 +134,7 @@ def researcher(sub_question: str) -> ResearchFindings:
             f"Failed to parse response from Gemini into a ResearchFindings Pydantic model: {e}"
         )
 
-# 2. Write a function critic(research_question: str, findings: list[ResearchFindings]) -> CriticReview
+# Write a function critic(research_question: str, findings: list[ResearchFindings]) -> CriticReview
 def critic(research_question: str, findings: list[ResearchFindings]) -> CriticReview:
     """Critically evaluate the findings to find gaps or weak sources."""
     model_name = get_model_name()
@@ -147,7 +167,8 @@ def critic(research_question: str, findings: list[ResearchFindings]) -> CriticRe
         temperature=0.2
     )
     
-    response = model.generate_content(
+    response = generate_content_with_retry(
+        model,
         prompt,
         generation_config=generation_config
     )
@@ -189,10 +210,10 @@ def writer(research_question: str, findings: list[ResearchFindings]) -> str:
         f"3. Style: Return ONLY the final report as a plain text/markdown string.\n"
     )
     
-    response = model.generate_content(prompt)
+    response = generate_content_with_retry(model, prompt)
     return response.text.strip()
 
-# 3. Modify run_pipeline() to add a self-correction loop
+# Modify run_pipeline() to add a self-correction loop
 def run_pipeline(research_question: str) -> tuple[str, int, list[str]]:
     """Run the complete planning, research, critic self-correction, and writing pipeline."""
     print("Planning...")
@@ -267,7 +288,7 @@ if __name__ == "__main__":
             
         print("Report saved to report.md")
         
-        # 5. Print a short summary of how many critic loop iterations ran and what gaps (if any) were found and fixed
+        # Print a short summary of how many critic loop iterations ran and what gaps (if any) were found and fixed
         print("\n================ SUMMARY ================")
         print(f"Critic loop iterations run: {loop_iterations}")
         if gaps_found:
